@@ -1,0 +1,11 @@
+version: "3.9"
+
+services:
+    aws-deployer:
+        build: .
+        image: naxim/aws-deployer
+        container_name: aws_deployer
+        volumes:
+            - .:/app
+        # entrypoint: 
+        #   - /app/script/entrypoint.sh

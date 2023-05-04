@@ -1,0 +1,9 @@
+/private/*
+!/private/*.sample
+!/private/.gitkeep
+/venv/*
+!/venv/.gitkeep
+/logs/*
+!/logs/.gitkeep
+project.sublime-workspace
+project.sublime-project
