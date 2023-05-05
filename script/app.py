@@ -1,6 +1,7 @@
 import os
 import boto3
 import logging
+import mimetypes
 from dotenv import load_dotenv
 
 
@@ -49,6 +50,9 @@ def main():
     # acm_client = aws_session.client('acm')
     # acm_client.list_certificates()
 
+    # CV site
+    uploadSiteCode(s3_client)
+
 
 def check_domain_registration(route53d_client):
     resp = None
@@ -90,8 +94,7 @@ def register_domain(route53d_client):
                                         PrivacyProtectTechContact=True)
     except Exception as Error:
         error_handler(Error)
-    print(resp)
-    debug(''.join('AWS Operation ID', resp['OperationId']))
+    error_handler(''.join('AWS Operation ID', resp['OperationId']))
 
 
 def get_dns_zone_id(route53_client):
@@ -253,12 +256,34 @@ def create_dns_a_record(route53_client, zone_id):
         error_handler(Error)
 
 
+def uploadSiteCode(s3_client):
+    try:
+        for root, dirs, files in os.walk(cv_site_path):
+            for file in files:
+                bucket_file_path = file
+                folder = (str(root).replace('../cv/','').replace('\\', '/'))
+                if folder != '':
+                    bucket_file_path = ''.join([folder, '/', file])
+                content_type = mimetypes.guess_type(file)
+                if content_type[0] is None:
+                    content_type = 'text/plain'
+                else:
+                    content_type = content_type[0]
+                s3_client.upload_file(os.path.join(root, file),
+                                      bucket_name,
+                                      bucket_file_path,
+                                      ExtraArgs={'ContentType': content_type})
+    except Exception as Error:
+        error_handler(Error)
+
+
 if __name__ == "__main__":
     dotenv_path = "../private/.env"
     log_path = "../logs"
     log_level = logging.WARNING
     load_dotenv(dotenv_path=dotenv_path)
 
+    cv_site_path = '../cv/'
     aws_tag = os.getenv('AWS_TAG', default='cv')
 
     domain_name = os.getenv('DOMAIN_NAME')
