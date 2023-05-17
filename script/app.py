@@ -3,11 +3,17 @@ import boto3
 import logging
 import mimetypes
 from dotenv import load_dotenv
+from time import sleep
+# from time import time
 
 
 def error_handler(exception):
     logger.error(exception)
     exit(1)
+
+
+def log_handler(msg):
+    print(msg)
 
 
 def debug(msg):
@@ -20,37 +26,71 @@ def main():
     # S3 bucket
     s3_client = aws_session.client('s3')
     if not check_bucket_exists(s3_client):
-        print('Need to create bucket!')
+        log_handler('Creating bucket....')
         create_bucket(s3_client)
         add_bucket_tag(s3_client)
-    # Remove ---------------
-    # else:
-    #     create_bucket(s3_client)
-    # ----------------------
 
     # DNS ZONE
     route53d_client = aws_session.client('route53domains', 'us-east-1')
     route53_client = aws_session.client('route53', 'us-east-1')
     zone_id = None
     if not check_domain_registration(route53d_client):
-        print("Register domain.....!")
+        log_handler("Registering domain....")
         register_domain(route53d_client)
         zone_id = get_dns_zone_id(route53_client)
         add_domain_tag(route53_domains_client=route53d_client,
                        route53_client=route53_client,
                        zone_id=zone_id)
 
-    # DNS RECORD
     if zone_id is None:
         zone_id = get_dns_zone_id(route53_client)
-    if not check_dns_rr(route53_client=route53_client, zone_id=zone_id):
-        create_dns_a_record(route53_client=route53_client, zone_id=zone_id)
+    # I decided to chooze Cloudfront distribution against S3 bucket static website hosting
+    # So it doesn't need to configure DNS for cloudfront working
+    # if not check_dns_rr(route53_client=route53_client, zone_id=zone_id, type='A'):
+    #     log_handler('Creating DNS RR....')
+    #     create_dns_a_record(route53_client=route53_client, zone_id=zone_id)
 
     # SSL
-    # acm_client = aws_session.client('acm')
-    # acm_client.list_certificates()
+    acm_client = aws_session.client('acm', 'us-east-1')
+    ssl_exists, ssl_status, ssl_arn = check_ssl_cert(acm_client)
+    if not ssl_exists:
+        log_handler('Creating SSL request....')
+        create_ssl_request(acm_client)
+        sleep(5)
+
+        for i in range(5):
+            sleep(2)
+            ssl_exists, ssl_status, ssl_arn = check_ssl_cert(acm_client)
+            if ssl_exists:
+                break
+        if not ssl_exists:
+            error_handler('Something is going wrong while validating ssl cert')
+    if ssl_exists and ssl_status == 'PENDING_VALIDATION':
+        log_handler('Validating SSL request....')
+        validate_ssl(acm_client=acm_client,
+                     route53_client=route53_client,
+                     zone_id=zone_id,
+                     cert_arn=ssl_arn)
+
+    # Cloudfront
+    cf_client = aws_session.client('cloudfront')
+    cf_distribution_exists, cf_distribution_domain = check_cf_distribution(
+        cf_client)
+    if not cf_distribution_exists:
+        create_cf_distribution(cf_client, ssl_arn)
+        cf_distribution_exists, cf_distribution_domain = check_cf_distribution(
+            cf_client)
+
+    # DNS RECORD
+    if not check_dns_rr(route53_client=route53_client, zone_id=zone_id, rr_type='A'):
+        log_handler('Creating DNS RR....')
+        create_dns_a_record(route53_client=route53_client,
+                            zone_id=zone_id,
+                            s3=False,
+                            cf_domain_name=cf_distribution_domain)
 
     # CV site
+    log_handler('Uploading CV to AWS....')
     uploadSiteCode(s3_client)
 
 
@@ -217,7 +257,7 @@ def add_bucket_tag(s3_client):
         error_handler(Error)
 
 
-def check_dns_rr(route53_client, zone_id):
+def check_dns_rr(route53_client, zone_id, rr_type='A'):
     resp = None
     try:
         resp = route53_client.list_resource_record_sets(
@@ -227,14 +267,20 @@ def check_dns_rr(route53_client, zone_id):
         error_handler(Error)
 
     dns_rr_list = [rr['Name'] for rr in resp['ResourceRecordSets']
-                   if rr['Type'] == 'A' and rr['Name'] == domain_name + '.']
+                   if rr['Type'] == rr_type and rr['Name'] == domain_name + '.']
     if len(dns_rr_list) > 0:
         return True
     return False
 
 
-def create_dns_a_record(route53_client, zone_id):
+def create_dns_a_record(route53_client, zone_id, s3=True, cf_domain_name=''):
     s3_endpoint = 's3-website.eu-north-1.amazonaws.com.'
+    if s3:
+        endpoint = s3_endpoint
+        hostedZoneId = 'Z3BAZG2TWCNX0D'
+    else:
+        endpoint = cf_domain_name
+        hostedZoneId = 'Z2FDTNDATAQYW2'
     try:
         route53_client.change_resource_record_sets(HostedZoneId=zone_id,
                                                    ChangeBatch={
@@ -244,11 +290,32 @@ def create_dns_a_record(route53_client, zone_id):
                                                                'ResourceRecordSet': {
                                                                    'Name': domain_name,
                                                                    'AliasTarget': {
-                                                                       'HostedZoneId': 'Z3BAZG2TWCNX0D',
-                                                                       'DNSName': s3_endpoint,
+                                                                       # Z3BAZG2TWCNX0D - s3
+                                                                       # Z2FDTNDATAQYW2 - cloudfront
+                                                                       'HostedZoneId': hostedZoneId,
+                                                                       'DNSName': endpoint,
                                                                        'EvaluateTargetHealth': False
                                                                    },
                                                                    'Type': 'A',
+                                                               },
+                                                           },
+                                                       ]})
+    except Exception as Error:
+        error_handler(Error)
+
+
+def create_dns_cname_record(route53_client, zone_id, rr_name, rr_value):
+    try:
+        route53_client.change_resource_record_sets(HostedZoneId=zone_id,
+                                                   ChangeBatch={
+                                                       'Changes': [
+                                                           {
+                                                               'Action': 'CREATE',
+                                                               'ResourceRecordSet': {
+                                                                   'Name': rr_name,
+                                                                   'Type': 'CNAME',
+                                                                   'TTL': 300,
+                                                                   'ResourceRecords': [{'Value': rr_value}]
                                                                },
                                                            },
                                                        ]})
@@ -261,7 +328,7 @@ def uploadSiteCode(s3_client):
         for root, dirs, files in os.walk(cv_site_path):
             for file in files:
                 bucket_file_path = file
-                folder = (str(root).replace('../cv/','').replace('\\', '/'))
+                folder = (str(root).replace('../cv/', '').replace('\\', '/'))
                 if folder != '':
                     bucket_file_path = ''.join([folder, '/', file])
                 content_type = mimetypes.guess_type(file)
@@ -277,6 +344,173 @@ def uploadSiteCode(s3_client):
         error_handler(Error)
 
 
+def check_ssl_cert(acm_client):
+    resp = None
+    try:
+        resp = acm_client.list_certificates()
+    except Exception as Error:
+        error_handler(Error)
+
+    ssl_list = [ssl for ssl in resp['CertificateSummaryList']
+                if ssl['DomainName'] == domain_name]
+    if len(ssl_list) == 0:
+        return False, None, None
+    return True, ssl_list[0]['Status'], ssl_list[0]['CertificateArn']
+
+
+def create_ssl_request(acm_client):
+    resp = None
+    try:
+        resp = acm_client.request_certificate(DomainName=domain_name,
+                                              ValidationMethod='DNS',
+                                              Tags=[
+                                                  {
+                                                      'Key': aws_tag,
+                                                      'Value': ''
+                                                  }
+                                              ]
+                                              )
+    except Exception as Error:
+        error_handler(Error)
+    return resp['CertificateArn']
+
+
+def check_cf_distribution(cf_client):
+    resp = None
+    try:
+        resp = cf_client.list_distributions()
+    except Exception as Error:
+        error_handler(Error)
+
+    if resp['DistributionList']['Quantity'] == 0:
+        return False, None
+    list_distributions = [d for d in resp['DistributionList']['Items']
+                          if 'Origins' in d
+                          and 'Items' in d['Origins']
+                          and len(d['Origins']['Items']) > 0
+                          and d['Origins']['Items'][0]['Id'] == domain_name]
+    if len(list_distributions) == 0:
+        return False, None
+    return True, list_distributions[0]['DomainName']
+
+
+def create_cf_distribution(cf_client, cert_arn):
+    resp = None
+    origin_domain = '{0}.s3-website.{1}.amazonaws.com'.format(
+        domain_name, aws_region)
+    try:
+        resp = cf_client.create_distribution_with_tags(
+            DistributionConfigWithTags=dict({
+                'DistributionConfig': {
+                    # 'CallerReference': str(time()).replace(".", ""),
+                    'CallerReference': domain_name,
+                    'DefaultRootObject': 'index.html',
+                    'Aliases':
+                    {
+                        'Quantity': 1,
+                        'Items': [
+                            domain_name,
+                        ]
+                    },
+                    'Origins': {
+                        'Quantity': 1,
+                        'Items': [
+                            {
+                                'Id': domain_name,
+                                'DomainName': origin_domain,
+                                # 'OriginPath': '/index.html',
+                                'CustomOriginConfig': {
+                                    'HTTPPort': 80,
+                                    'HTTPSPort': 443,
+                                    'OriginProtocolPolicy': 'http-only',
+                                },
+                                'OriginShield': {
+                                    'Enabled': False
+                                }
+                            }
+                        ]
+                    },
+                    'DefaultCacheBehavior': {
+                        'TargetOriginId': domain_name,
+                        'ViewerProtocolPolicy': 'redirect-to-https',
+                        'AllowedMethods': {
+                            'Quantity': 2,
+                            'Items': ['GET', 'HEAD'],
+                        },
+                        'Compress': True,
+                        'MinTTL': 0,
+                        'ForwardedValues': {
+                            'Cookies': {'Forward': 'all'},
+                            'Headers': {'Quantity': 0},
+                            'QueryString': False,
+                            'QueryStringCacheKeys': {"Quantity": 0}
+                        },
+                    },
+                    'PriceClass': 'PriceClass_100',
+                    'Enabled': True,
+                    'ViewerCertificate': {
+                        'CloudFrontDefaultCertificate': False,
+                        'ACMCertificateArn': cert_arn,
+                        'MinimumProtocolVersion': 'TLSv1.2_2018',
+                        'SSLSupportMethod': 'sni-only'
+                    },
+                    'Comment': ''
+                },
+                'Tags': {
+                    'Items': [
+                        {
+                            'Key': aws_tag,
+                            'Value': ''
+                        }
+                    ]
+                }
+            }
+            ))
+    except Exception as Error:
+        error_handler(Error)
+    if 'Distribution' in resp and 'DomainName' in resp['Distribution']:
+        cf_domain_name = resp['Distribution']['DomainName']
+        log_handler(
+            'Cloudfront distribution is getting ready in several minutes on https://{0}'.format(cf_domain_name))
+    else:
+        error_handler(
+            'Something is going wrong while creating Cloudfront distribution')
+
+
+def validate_ssl(acm_client, route53_client, zone_id, cert_arn):
+    resp = None
+    try:
+        resp = acm_client.describe_certificate(CertificateArn=cert_arn)
+    except Exception as Error:
+        error_handler(Error)
+    # ISSUED
+    # rr_type = resp['ResourceRecord']['Type']
+    rr_values = resp['Certificate']['DomainValidationOptions'][0]
+    if 'ResourceRecord' in rr_values:
+        rr_name = rr_values['ResourceRecord']['Name']
+        rr_value = rr_values['ResourceRecord']['Value']
+        create_dns_cname_record(route53_client, zone_id, rr_name, rr_value)
+    else:
+        error_handler('Something is going wrong while validating ssl cert')
+
+    issued = False
+    for t in [10, 20, 30, 60, 120, 120, 60, 30, 30]:
+        log_handler(
+            'Wait for {0} sec and check SSL cert validation....'.format(str(t)))
+        resp = None
+        sleep(t)
+        try:
+            resp = acm_client.describe_certificate(CertificateArn=cert_arn)
+        except Exception as Error:
+            error_handler(Error)
+        if resp['Certificate']['DomainValidationOptions'][0]['ValidationStatus'] == 'SUCCESS':
+            issued = True
+            log_handler('SSL certificate is issued successfully')
+            break
+    if not issued:
+        error_handler('Something is going wrong while validating ssl cert')
+
+
 if __name__ == "__main__":
     dotenv_path = "../private/.env"
     log_path = "../logs"
@@ -285,6 +519,7 @@ if __name__ == "__main__":
 
     cv_site_path = '../cv/'
     aws_tag = os.getenv('AWS_TAG', default='cv')
+    aws_region = os.getenv('AWS_REGION')
 
     domain_name = os.getenv('DOMAIN_NAME')
     dns_admin_country_code = os.getenv(
